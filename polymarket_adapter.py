@@ -43,6 +43,7 @@ class TokenConfig:
     tick_size: Decimal
     neg_risk: bool
     min_order_size: Decimal = Decimal("5")
+    end_date_iso: str = ""
 
 
 @dataclass(frozen=True)
@@ -99,8 +100,15 @@ class PolymarketAdapter:
 
     def resolve_tokens(self) -> tuple[TokenConfig, TokenConfig, str]:
         if self.config.token_yes and self.config.token_no:
-            yes = self._token_config(self.config.token_yes, "YES")
-            no = self._token_config(self.config.token_no, "NO")
+            end_date_iso = ""
+            if self.config.condition_id:
+                try:
+                    market = self.client.get_market(self.config.condition_id)
+                    end_date_iso = str(market.get("end_date_iso") or market.get("game_start_time") or "")
+                except Exception as exc:
+                    LOGGER.debug("Could not fetch market end date: %s", exc)
+            yes = self._token_config(self.config.token_yes, "YES", end_date_iso=end_date_iso)
+            no = self._token_config(self.config.token_no, "NO", end_date_iso=end_date_iso)
             return yes, no, self.config.condition_id
 
         condition_id = self.config.condition_id
@@ -112,14 +120,15 @@ class PolymarketAdapter:
         if len(tokens) < 2:
             raise RuntimeError(f"Could not parse two outcome tokens from market {condition_id}")
 
-        yes = self._token_config(tokens[0][0], tokens[0][1] or "YES")
-        no = self._token_config(tokens[1][0], tokens[1][1] or "NO")
+        end_date_iso = str(market.get("end_date_iso") or market.get("game_start_time") or "")
+        yes = self._token_config(tokens[0][0], tokens[0][1] or "YES", end_date_iso=end_date_iso)
+        no = self._token_config(tokens[1][0], tokens[1][1] or "NO", end_date_iso=end_date_iso)
         LOGGER.info("Resolved market condition_id=%s yes=%s no=%s", condition_id, yes.token_id, no.token_id)
         return yes, no, condition_id
 
     def resolve_market_spec(self, spec: MarketSpec) -> tuple[TokenConfig, TokenConfig, str]:
-        yes = self._token_config(spec.token_yes, "YES")
-        no = self._token_config(spec.token_no, "NO")
+        yes = self._token_config(spec.token_yes, "YES", end_date_iso=spec.end_date_iso)
+        no = self._token_config(spec.token_no, "NO", end_date_iso=spec.end_date_iso)
         LOGGER.info(
             "Resolved sheet market condition_id=%s yes=%s no=%s question=%s",
             spec.condition_id or "<token-only>",
@@ -265,7 +274,7 @@ class PolymarketAdapter:
             return Decimal(str(value))
         return Decimal(str(result or "0"))
 
-    def _token_config(self, token_id: str, outcome: str) -> TokenConfig:
+    def _token_config(self, token_id: str, outcome: str, end_date_iso: str = "") -> TokenConfig:
         book = self.client.get_order_book(str(token_id))
         min_order_size = Decimal(str(getattr(book, "min_order_size", "5") or "5"))
         return TokenConfig(
@@ -274,6 +283,7 @@ class PolymarketAdapter:
             tick_size=Decimal(str(self.client.get_tick_size(str(token_id)))),
             neg_risk=bool(self.client.get_neg_risk(str(token_id))),
             min_order_size=min_order_size,
+            end_date_iso=end_date_iso,
         )
 
     @staticmethod

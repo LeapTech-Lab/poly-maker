@@ -75,6 +75,12 @@ class BotConfig:
     count_existing_positions_in_global_limit: bool = _bool("COUNT_EXISTING_POSITIONS_IN_GLOBAL_LIMIT", "false")
     inventory_skew_threshold_usdc: Decimal = _decimal("INVENTORY_SKEW_THRESHOLD_USDC", "18")
     inventory_skew_bps: Decimal = _decimal("INVENTORY_SKEW_BPS", "60")
+    stop_loss_pct: Decimal = _decimal("STOP_LOSS_PCT", "12")
+    take_profit_pct: Decimal = _decimal("TAKE_PROFIT_PCT", "8")
+    max_market_loss_usdc: Decimal = _decimal("MAX_MARKET_LOSS_USDC", "8")
+    max_midpoint_move_bps: Decimal = _decimal("MAX_MIDPOINT_MOVE_BPS", "350")
+    close_only_hours_before_end: int = _int("CLOSE_ONLY_HOURS_BEFORE_END", "24")
+    risk_off_after_stop: bool = _bool("RISK_OFF_AFTER_STOP", "true")
 
     cancel_on_start: bool = _bool("CANCEL_ON_START", "true")
     post_only: bool = _bool("POST_ONLY", "true")
@@ -88,6 +94,18 @@ class BotConfig:
     @property
     def inventory_skew_fraction(self) -> Decimal:
         return self.inventory_skew_bps / Decimal("10000")
+
+    @property
+    def stop_loss_fraction(self) -> Decimal:
+        return self.stop_loss_pct / Decimal("100")
+
+    @property
+    def take_profit_fraction(self) -> Decimal:
+        return self.take_profit_pct / Decimal("100")
+
+    @property
+    def max_midpoint_move_fraction(self) -> Decimal:
+        return self.max_midpoint_move_bps / Decimal("10000")
 
     def validate(self) -> None:
         if not self.private_key and not self.dry_run:

@@ -129,6 +129,11 @@ MAX_GLOBAL_EXPOSURE_USDC=80
 - `MAX_GLOBAL_EXPOSURE_USDC`：本机器人新增加的全局风险上限，100 USDC 资金建议不超过 80。
 - `COUNT_EXISTING_POSITIONS_IN_GLOBAL_LIMIT=false`：默认不把你账户已有老仓位算进本机器人全局上限；如果想按账户总持仓硬控，改成 `true`。
 - `INVENTORY_SKEW_THRESHOLD_USDC`：某 token 持仓超过该值后降低该 token 买单价格。
+- `STOP_LOSS_PCT`：单边仓位亏损超过该比例时停止加仓，并尝试挂卖单退出。
+- `TAKE_PROFIT_PCT`：单边仓位盈利超过该比例时优先挂卖单落袋。
+- `MAX_MARKET_LOSS_USDC`：当前市场未实现亏损超过该美元数时进入 close-only。
+- `MAX_MIDPOINT_MOVE_BPS`：midpoint 单轮跳变过大时暂停新买单，避免新闻/赛况冲击。
+- `CLOSE_ONLY_HOURS_BEFORE_END`：临近结算前只减仓不开新仓；需要表格或 market info 有结束时间。
 - `POST_ONLY=true`：尽量保证 maker，不主动吃单。
 
 ## 启动

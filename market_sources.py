@@ -21,6 +21,7 @@ class MarketSpec:
     token_yes: str
     token_no: str
     question: str = ""
+    end_date_iso: str = ""
 
 
 def load_google_sheet_markets(config: BotConfig) -> list[MarketSpec]:
@@ -91,6 +92,15 @@ def _df_to_specs(df: pd.DataFrame) -> list[MarketSpec]:
         token_no = _first(row, ("token2", "token_no", "TOKEN_ID_NO", "no_token_id", "NO_TOKEN_ID"))
         condition_id = _first(row, ("condition_id", "CONDITION_ID", "conditionId"))
         question = _first(row, ("question", "title", "market_slug"))
+        end_date_iso = _first(row, ("end_date_iso", "endDate", "end_date", "game_start_time"))
         if token_yes and token_no:
-            specs.append(MarketSpec(condition_id=condition_id, token_yes=token_yes, token_no=token_no, question=question))
+            specs.append(
+                MarketSpec(
+                    condition_id=condition_id,
+                    token_yes=token_yes,
+                    token_no=token_no,
+                    question=question,
+                    end_date_iso=end_date_iso,
+                )
+            )
     return specs

@@ -10,6 +10,7 @@ import logging
 import signal
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 
 from config import BotConfig
@@ -43,6 +44,8 @@ class MarketMaker:
         self.no: TokenConfig
         self.condition_id: str
         self.initial_market_exposure = Decimal("0")
+        self.last_midpoints: dict[str, Decimal] = {}
+        self.risk_off = False
 
     def run(self) -> None:
         self.bootstrap()
@@ -129,16 +132,36 @@ class MarketMaker:
         if market_exposure >= self.config.max_market_exposure_usdc:
             LOGGER.warning("Market exposure limit hit; only risk-reducing quotes allowed")
 
+        close_only = self.risk_off or self._is_close_only_window()
+        if close_only:
+            LOGGER.warning("Close-only mode active; new buy quotes are disabled")
+
+        if self._market_loss_limit_hit(unrealized_pnl):
+            close_only = True
+            self.risk_off = self.config.risk_off_after_stop
+            LOGGER.warning("Market loss limit hit; close-only mode enabled")
+
         orders: list[TargetOrder] = []
         for token in tokens:
             quote = quotes[token.token_id]
             position = positions[token.token_id]
-            maybe_order = self._build_buy_order(token, quote, position, market_exposure)
+            allow_new_buy = not close_only and not self._position_risk_off(token, quote, position)
+            if self._midpoint_jump_detected(token, quote):
+                allow_new_buy = False
+                LOGGER.warning("%s midpoint moved too fast; skip new buy quote", token.outcome)
+
+            maybe_order = (
+                self._build_buy_order(token, quote, position, market_exposure)
+                if allow_new_buy
+                else None
+            )
             if maybe_order:
                 orders.append(maybe_order)
-            maybe_sell = self._build_sell_order(token, quote, position)
+            maybe_sell = self._build_sell_order(token, quote, position, force_exit=close_only)
             if maybe_sell:
                 orders.append(maybe_sell)
+
+            self.last_midpoints[token.token_id] = quote.mid
 
         self._cancel_working_orders()
         for order in orders:
@@ -212,13 +235,17 @@ class MarketMaker:
         token: TokenConfig,
         quote: Quote,
         position: Position,
+        force_exit: bool = False,
     ) -> TargetOrder | None:
         if position.size <= 0 or quote.mid <= 0:
             return None
 
         reason = "inventory_exit"
         skew = Decimal("0")
-        if position.notional >= self.config.inventory_skew_threshold_usdc:
+        if force_exit or self._position_risk_off(token, quote, position):
+            skew = self.config.spread_fraction
+            reason = "risk_exit"
+        elif position.notional >= self.config.inventory_skew_threshold_usdc:
             skew = self.config.inventory_skew_fraction
             reason = "inventory_skew_exit"
 
@@ -250,6 +277,60 @@ class MarketMaker:
             reason,
         )
         return TargetOrder(token=token, side="SELL", price=ask, shares=shares, reason=reason)
+
+    def _position_return(self, position: Position) -> Decimal:
+        if position.size <= 0 or position.avg_price <= 0:
+            return Decimal("0")
+        return (position.current_price - position.avg_price) / position.avg_price
+
+    def _position_risk_off(self, token: TokenConfig, quote: Quote, position: Position) -> bool:
+        ret = self._position_return(position)
+        if position.size <= 0:
+            return False
+        if ret <= -self.config.stop_loss_fraction:
+            LOGGER.warning(
+                "%s stop loss hit: return=%.2f%% avg=%s mid=%s",
+                token.outcome,
+                float(ret * Decimal("100")),
+                position.avg_price,
+                quote.mid,
+            )
+            self.risk_off = self.config.risk_off_after_stop
+            return True
+        if ret >= self.config.take_profit_fraction:
+            LOGGER.info(
+                "%s take profit hit: return=%.2f%% avg=%s mid=%s",
+                token.outcome,
+                float(ret * Decimal("100")),
+                position.avg_price,
+                quote.mid,
+            )
+            return True
+        return False
+
+    def _market_loss_limit_hit(self, unrealized_pnl: Decimal) -> bool:
+        return unrealized_pnl <= -self.config.max_market_loss_usdc
+
+    def _midpoint_jump_detected(self, token: TokenConfig, quote: Quote) -> bool:
+        last_mid = self.last_midpoints.get(token.token_id)
+        if not last_mid or last_mid <= 0:
+            return False
+        move = abs(quote.mid - last_mid) / last_mid
+        return move >= self.config.max_midpoint_move_fraction
+
+    def _is_close_only_window(self) -> bool:
+        end_date_iso = self.yes.end_date_iso or self.no.end_date_iso
+        if not end_date_iso or self.config.close_only_hours_before_end <= 0:
+            return False
+        try:
+            normalized = end_date_iso.replace("Z", "+00:00")
+            end_dt = datetime.fromisoformat(normalized)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return False
+        seconds_left = (end_dt - datetime.now(timezone.utc)).total_seconds()
+        return seconds_left <= self.config.close_only_hours_before_end * 3600
 
     def _shares_for_notional(
         self,
