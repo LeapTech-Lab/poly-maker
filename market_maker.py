@@ -110,14 +110,28 @@ class MarketMaker:
         unrealized_pnl = sum(position.unrealized_pnl for position in positions.values())
         rewards = self.adapter.today_rewards_estimate(self.condition_id)
 
+        # [STAT] 每轮状态概览
         LOGGER.info(
-            "Monitor market_exposure=$%.2f bot_exposure=$%.2f account_exposure=$%.2f uPnL=$%.2f rewards_today~$%.4f",
-            float(market_exposure),
-            float(bot_exposure),
+            "[STATUS] Market=%s | AccountExposure=$%.2f | MarketExposure=$%.2f | uPnL=$%.2f | Rewards~$%.4f",
+            self.condition_id or "N/A",
             float(account_exposure),
+            float(market_exposure),
             float(unrealized_pnl),
             float(rewards),
         )
+
+        # 检查持仓变化，辅助判断是否成交
+        for token in tokens:
+            pos = positions[token.token_id]
+            if pos.size > 0:
+                LOGGER.info(
+                    "[POSITION] %s: Size=%s | AvgPrice=%s | CurPrice=%s | uPnL=$%.2f",
+                    token.outcome,
+                    pos.size,
+                    pos.avg_price,
+                    pos.current_price,
+                    float(pos.unrealized_pnl),
+                )
 
         if risk_exposure >= self.config.max_global_exposure_usdc:
             LOGGER.warning(
@@ -139,16 +153,27 @@ class MarketMaker:
         if self._market_loss_limit_hit(unrealized_pnl):
             close_only = True
             self.risk_off = self.config.risk_off_after_stop
-            LOGGER.warning("Market loss limit hit; close-only mode enabled")
+            LOGGER.warning("[RISK] Market loss limit hit (uPnL=$%.2f); enabling close-only mode", float(unrealized_pnl))
 
         orders: list[TargetOrder] = []
         for token in tokens:
             quote = quotes[token.token_id]
             position = positions[token.token_id]
+            
+            # 记录盘口详情
+            LOGGER.info(
+                "[MARKET] %s: Mid=%s | Bid=%s | Ask=%s | LastMid=%s",
+                token.outcome,
+                quote.mid,
+                quote.bid,
+                quote.ask,
+                self.last_midpoints.get(token.token_id, "N/A"),
+            )
+
             allow_new_buy = not close_only and not self._position_risk_off(token, quote, position)
             if self._midpoint_jump_detected(token, quote):
                 allow_new_buy = False
-                LOGGER.warning("%s midpoint moved too fast; skip new buy quote", token.outcome)
+                LOGGER.warning("[STRATEGY] %s midpoint jumped too fast; skipping buy", token.outcome)
 
             maybe_order = (
                 self._build_buy_order(token, quote, position, market_exposure)
@@ -157,14 +182,27 @@ class MarketMaker:
             )
             if maybe_order:
                 orders.append(maybe_order)
+            
             maybe_sell = self._build_sell_order(token, quote, position, force_exit=close_only)
             if maybe_sell:
                 orders.append(maybe_sell)
 
             self.last_midpoints[token.token_id] = quote.mid
 
+        # 撤单前记录
+        LOGGER.info("[STRATEGY] Refreshing orders: cancelling existing and placing %d new targets", len(orders))
         self._cancel_working_orders()
+        
         for order in orders:
+            LOGGER.info(
+                "[TRADE] Placing %s %s: Price=%s | Shares=%s | Notional=$%.2f | Reason=%s",
+                order.side,
+                order.token.outcome,
+                order.price,
+                order.shares,
+                float(order.notional),
+                order.reason,
+            )
             self.adapter.place_limit_order(
                 token=order.token,
                 side=order.side,
@@ -196,9 +234,16 @@ class MarketMaker:
             skew = self.config.inventory_skew_fraction
             reason = "inventory_skew"
 
-        bid = quote.mid * (Decimal("1") - self.config.spread_fraction - skew)
+        spread = self.config.spread_fraction
+        bid = quote.mid * (Decimal("1") - spread - skew)
         bid = max(self.config.min_price, min(self.config.max_price, bid))
         bid = self.adapter.round_price(bid, token.tick_size, ROUND_DOWN)
+        
+        LOGGER.debug(
+            "[DEBUG] %s Buy Calculation: Mid=%s * (1 - Spread=%s - Skew=%s) = %s -> Final Bid=%s",
+            token.outcome, quote.mid, spread, skew, (quote.mid * (Decimal("1") - spread - skew)), bid
+        )
+
         if bid <= 0:
             return None
 

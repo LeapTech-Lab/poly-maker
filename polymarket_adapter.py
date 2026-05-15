@@ -247,12 +247,17 @@ class PolymarketAdapter:
             )
         except PolyApiException as exc:
             msg = str(exc.error_msg).lower()
+            LOGGER.error("[API_ERROR] %s %s failed: %s", side, token.outcome, msg)
             if "invalid signature" in msg or "invalid funder" in msg:
                 raise FatalTradingError(
                     "Order signing failed. Check PK, SIGNATURE_TYPE, and FUNDER_ADDRESS."
                 ) from exc
             raise
-        LOGGER.info("Posted %s %s shares=%s price=%s response=%s", side, token.outcome, size, price, response)
+        except Exception as exc:
+            LOGGER.error("[API_FATAL] Unexpected error during %s %s: %s", side, token.outcome, exc)
+            raise
+
+        LOGGER.info("[API_SUCCESS] Posted %s %s shares=%s price=%s response=%s", side, token.outcome, size, price, response)
         return response
 
     @staticmethod
