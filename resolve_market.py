@@ -35,6 +35,8 @@ def normalize_slug(value: str) -> str:
 
 def get_json(url: str) -> Any:
     response = requests.get(url, timeout=20)
+    if response.status_code == 404:
+        return {}
     response.raise_for_status()
     return response.json()
 
@@ -54,20 +56,54 @@ def parse_jsonish(value: Any) -> list[str]:
     return [str(value)]
 
 
-def market_from_slug(slug: str) -> dict[str, Any]:
+def market_from_slug(slug: str, index: int | None = None, contains: str = "") -> dict[str, Any]:
     # 单市场 URL 通常最后一段就是 market slug。
     direct = get_json(f"{GAMMA}/markets/slug/{slug}")
     if isinstance(direct, dict) and direct:
-        return direct
+        if direct.get("type") == "not found error":
+            direct = {}
+        else:
+            return direct
 
     # 有些网页 URL 最后一段可能是 event slug，兜底查 event 下的 markets。
     event = get_json(f"{GAMMA}/events/slug/{slug}")
     markets = event.get("markets", []) if isinstance(event, dict) else []
     if markets:
+        if contains:
+            wanted = contains.lower()
+            matches = [
+                market for market in markets
+                if wanted in str(market.get("question") or market.get("title") or market.get("slug") or "").lower()
+            ]
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                print_event_markets(matches, prefix=f"匹配到多个包含 {contains!r} 的子市场")
+                raise RuntimeError("请用 --index 指定其中一个编号")
+            print_event_markets(markets, prefix=f"没有找到包含 {contains!r} 的子市场")
+            raise RuntimeError("请换一个 --contains 关键词")
+
+        if index is not None:
+            if index < 0 or index >= len(markets):
+                print_event_markets(markets)
+                raise RuntimeError(f"--index 超出范围：0 到 {len(markets) - 1}")
+            return markets[index]
+
         if len(markets) > 1:
-            print("这个 event 下有多个子市场，默认打印第一个。请复制具体子市场 URL 会更准。")
+            print_event_markets(markets)
+            raise RuntimeError("这是 event 页面，请加 --index N 或 --contains 'December 31' 选择具体子市场")
         return markets[0]
     raise RuntimeError(f"No market found for slug={slug}")
+
+
+def print_event_markets(markets: list[dict[str, Any]], prefix: str = "这个 event 下有多个子市场") -> None:
+    print(prefix + "：")
+    for idx, market in enumerate(markets):
+        question = market.get("question") or market.get("title") or market.get("slug") or ""
+        condition_id = market.get("condition_id") or market.get("conditionId") or ""
+        print(f"[{idx}] {question}")
+        print(f"    slug={market.get('slug')}")
+        print(f"    condition_id={condition_id}")
 
 
 def market_from_condition_id(condition_id: str) -> dict[str, Any]:
@@ -75,10 +111,10 @@ def market_from_condition_id(condition_id: str) -> dict[str, Any]:
     return client.get_market(condition_id)
 
 
-def extract_market(value: str) -> dict[str, Any]:
+def extract_market(value: str, index: int | None = None, contains: str = "") -> dict[str, Any]:
     if re.fullmatch(r"0x[a-fA-F0-9]{64}", value.strip()):
         return market_from_condition_id(value.strip())
-    return market_from_slug(normalize_slug(value))
+    return market_from_slug(normalize_slug(value), index=index, contains=contains)
 
 
 def print_env(market: dict[str, Any]) -> None:
@@ -114,8 +150,10 @@ def print_env(market: dict[str, Any]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Resolve Polymarket URL/slug/condition_id to token IDs")
     parser.add_argument("market", help="Polymarket URL, slug, or condition_id")
+    parser.add_argument("--index", type=int, default=None, help="event 页面有多个子市场时，选择第几个，从 0 开始")
+    parser.add_argument("--contains", default="", help="event 页面有多个子市场时，按问题文本筛选，例如 'December 31'")
     args = parser.parse_args()
-    print_env(extract_market(args.market))
+    print_env(extract_market(args.market, index=args.index, contains=args.contains))
 
 
 if __name__ == "__main__":
