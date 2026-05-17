@@ -337,6 +337,7 @@ class MarketMaker:
                 position,
                 prediction.predicted_mid,
                 force_exit=close_only,
+                market_conviction_yes=market_conviction_yes,
             )
             if maybe_sell:
                 orders.append(maybe_sell)
