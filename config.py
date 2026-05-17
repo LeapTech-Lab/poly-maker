@@ -41,8 +41,8 @@ class BotConfig:
     """机器人运行参数。
 
     token_yes/token_no 优先；如果只给 condition_id，会自动从 CLOB market info 解析 token。
-    price_spread_bps 是旧报价参数；当前 FOK 主模式不使用它。
-    主模式使用 FOK 激进预测限价单，预测正确且流动性足够就立即全成交，否则整单取消。
+    price_spread_bps 是旧报价参数；当前模式使用预测价格进行挂单。
+    主模式使用 GTC Post-only 预测限价单，通过 Post-only 确保只做 Maker，不产生 Taker 手续费。
     order_notional_usdc 是每个订单希望投入的美元金额，代码会换算为 shares。
     """
 
@@ -84,8 +84,8 @@ class BotConfig:
     risk_off_after_stop: bool = _bool("RISK_OFF_AFTER_STOP", "true")
 
     cancel_on_start: bool = _bool("CANCEL_ON_START", "true")
-    order_type: str = (_env("ORDER_TYPE", "FOK") or "FOK").upper()
-    post_only: bool = _bool("POST_ONLY", "false")
+    order_type: str = (_env("ORDER_TYPE", "GTC") or "GTC").upper()
+    post_only: bool = _bool("POST_ONLY", "true")
     fok_price_buffer_bps: Decimal = _decimal("FOK_PRICE_BUFFER_BPS", "5")
     fok_min_edge_bps: Decimal = _decimal("FOK_MIN_EDGE_BPS", "1")
     cancel_unfilled_after_ms: int = _int("CANCEL_UNFILLED_AFTER_MS", "0")
@@ -127,14 +127,12 @@ class BotConfig:
     def validate(self) -> None:
         if not self.private_key and not self.dry_run:
             raise ValueError("PK is required when DRY_RUN=false")
-        if self.refresh_interval_seconds < 3:
-            raise ValueError("REFRESH_INTERVAL_SECONDS should be >= 3 to reduce API pressure")
+        if self.refresh_interval_seconds < 1:
+            LOGGER.warning("High frequency trading enabled (REFRESH_INTERVAL_SECONDS < 1)")
         if self.order_notional_usdc <= 0:
             raise ValueError("ORDER_NOTIONAL_USDC must be positive")
-        if self.order_type != "FOK":
-            raise ValueError("ORDER_TYPE must be FOK for the current strategy")
-        if self.post_only:
-            raise ValueError("POST_ONLY must be false when ORDER_TYPE=FOK")
+        if self.order_type not in {"FOK", "GTC"}:
+            raise ValueError("ORDER_TYPE must be FOK or GTC")
         if self.fok_price_buffer_bps < 0:
             raise ValueError("FOK_PRICE_BUFFER_BPS must be >= 0")
         if self.fok_min_edge_bps < 0:

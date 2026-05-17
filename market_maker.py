@@ -1,7 +1,7 @@
-"""短期预测驱动的 Polymarket FOK 执行逻辑。
+"""短期预测驱动的 Polymarket 做市逻辑。
 
-策略 intentionally 简单：预测延迟窗口后的成交价，使用 FOK 激进限价单尝试立刻全成交。
-预测错或流动性不足时，交易所会直接取消整单，不留下挂单。
+策略使用预测价格进行报价，支持 GTC + Post-only 模式以确保作为 Maker 提供流动性。
+当配置为 GTC 时，每轮 tick 会更新挂单，使用 Post-only 防止意外跨盘口成交。
 """
 
 from __future__ import annotations
@@ -103,15 +103,20 @@ class MarketMaker:
         self.initial_market_exposure = self._current_market_exposure()
 
         LOGGER.info(
-            "Starting FOK executor: condition_id=%s dry_run=%s order_notional=%s refresh=%ss initial_market_exposure=$%.2f",
+            "Starting Market Maker: condition_id=%s dry_run=%s order_type=%s post_only=%s order_notional=%s refresh=%ss",
             self.condition_id or "<token-only>",
             self.config.dry_run,
+            self.config.order_type,
+            self.config.post_only,
             self.config.order_notional_usdc,
             self.config.refresh_interval_seconds,
-            float(self.initial_market_exposure),
         )
 
     def tick(self) -> None:
+        # 对于 GTC 模式，每轮需要先清理之前的挂单
+        if self.config.order_type == "GTC":
+            self._cancel_working_orders()
+
         # 1. 获取所有市场数据
         tokens = (self.yes, self.no)
         snapshots = {token.token_id: self.adapter.get_order_book_snapshot(token) for token in tokens}
@@ -290,7 +295,7 @@ class MarketMaker:
         if predicted_mid <= 0:
             predicted_mid = quote.mid
 
-        reason = "fok_predicted_buy"
+        reason = "predicted_buy"
         if position.notional >= self.config.max_token_exposure_usdc:
             LOGGER.info("%s token exposure limit hit; skip buy quote", token.outcome)
             return None
@@ -298,29 +303,25 @@ class MarketMaker:
             LOGGER.info("Market exposure cap reached; skip new buy quote for %s", token.outcome)
             return None
         if position.notional >= self.config.inventory_skew_threshold_usdc:
-            reason = "fok_inventory_skew_buy"
+            reason = "inventory_skew_buy"
 
-        min_profitable_mid = quote.ask * (Decimal("1") + self.config.fok_min_edge_fraction)
-        required_edge_bps = (min_profitable_mid - quote.mid) / quote.mid * Decimal("10000")
-        if predicted_mid < min_profitable_mid:
+        # 盈利阈值检查：如果预测价格甚至不如当前买一价，则不挂单
+        if predicted_mid <= quote.bid:
             LOGGER.info(
-                "%s FOK buy skipped: predicted_mid=%s is below ask edge threshold %s "
-                "(need_edge_bps=%s)",
+                "%s buy skipped: predicted_mid=%s is not attractive enough (<= bid %s)",
                 token.outcome,
                 predicted_mid,
-                min_profitable_mid,
-                required_edge_bps,
+                quote.bid,
             )
             return None
 
-        bid = self._fok_limit_price(token, "BUY", predicted_mid, quote)
+        bid = self._calculate_limit_price(token, "BUY", predicted_mid, quote, position)
 
         LOGGER.debug(
-            "[DEBUG] %s FOK Buy Calculation: PredMid=%s Ask=%s BufferBps=%s -> Limit=%s",
+            "[DEBUG] %s Buy Calculation: PredMid=%s Ask=%s -> Limit=%s",
             token.outcome,
             predicted_mid,
             quote.ask,
-            self.config.fok_price_buffer_bps,
             bid,
         )
 
@@ -345,7 +346,7 @@ class MarketMaker:
             return None
 
         LOGGER.info(
-            "%s FOK buy quote mid=%s ask=%s limit=%s shares=%s notional=$%.2f reason=%s",
+            "%s buy quote mid=%s ask=%s limit=%s shares=%s notional=$%.2f reason=%s",
             token.outcome,
             quote.mid,
             quote.ask,
@@ -369,28 +370,25 @@ class MarketMaker:
         if predicted_mid <= 0:
             predicted_mid = quote.mid
 
-        reason = "fok_inventory_exit"
+        reason = "inventory_exit"
         force_sell = force_exit
         if force_exit or self._position_risk_off(token, quote, position):
             force_sell = True
-            reason = "fok_risk_exit"
+            reason = "risk_exit"
         elif position.notional >= self.config.inventory_skew_threshold_usdc:
-            reason = "fok_inventory_skew_exit"
+            reason = "inventory_skew_exit"
 
-        max_profitable_mid = quote.bid * (Decimal("1") - self.config.fok_min_edge_fraction)
-        required_edge_bps = (max_profitable_mid - quote.mid) / quote.mid * Decimal("10000")
-        if not force_sell and predicted_mid > max_profitable_mid:
+        # 盈利阈值检查：如果预测价格甚至高于当前卖一价，则不挂卖单
+        if not force_sell and predicted_mid >= quote.ask:
             LOGGER.info(
-                "%s FOK sell skipped: predicted_mid=%s is above bid edge threshold %s "
-                "(need_edge_bps=%s)",
+                "%s sell skipped: predicted_mid=%s is not attractive enough (>= ask %s)",
                 token.outcome,
                 predicted_mid,
-                max_profitable_mid,
-                required_edge_bps,
+                quote.ask,
             )
             return None
 
-        ask = self._fok_limit_price(token, "SELL", predicted_mid, quote)
+        ask = self._calculate_limit_price(token, "SELL", predicted_mid, quote, position)
         if ask <= 0:
             return None
 
@@ -407,7 +405,7 @@ class MarketMaker:
             return None
 
         LOGGER.info(
-            "%s FOK sell quote mid=%s bid=%s limit=%s shares=%s notional=$%.2f reason=%s",
+            "%s sell quote mid=%s bid=%s limit=%s shares=%s notional=$%.2f reason=%s",
             token.outcome,
             quote.mid,
             quote.bid,
@@ -538,22 +536,45 @@ class MarketMaker:
             _price, best_ask_size = min(asks, key=lambda level: level[0])
         return best_bid_size, best_ask_size
 
-    def _fok_limit_price(
+    def _calculate_limit_price(
         self,
         token: TokenConfig,
         side: str,
         predicted_mid: Decimal,
         quote: Quote,
+        position: Position,
     ) -> Decimal:
-        if side == "BUY":
-            raw_price = max(quote.ask, predicted_mid) * (
-                Decimal("1") + self.config.fok_price_buffer_fraction
-            )
-            price = min(self.config.max_price, max(self.config.min_price, raw_price))
-            return self.adapter.round_price(price, token.tick_size, ROUND_UP)
+        is_gtc = self.config.order_type == "GTC"
+        
+        # 计算仓位偏斜影响量 (Inventory Skew)
+        # 仓位比例: 当前持仓 / 最大持仓
+        inventory_ratio = position.notional / max(Decimal("1"), self.config.max_token_exposure_usdc)
+        # 根据持仓调整预测的中价：持仓越多，报价越低 (偏向卖出)
+        skew_adjust = inventory_ratio * self.config.inventory_skew_fraction * quote.mid
+        adjusted_fair = predicted_mid - skew_adjust
 
-        raw_price = min(quote.bid, predicted_mid) * (
-            Decimal("1") - self.config.fok_price_buffer_fraction
-        )
+        if side == "BUY":
+            if is_gtc:
+                # Maker 模式：买价必须 < 卖一 (quote.ask)
+                # 我们的目标价是预测中价与 (卖一 - 1 tick) 的最小值
+                target_price = min(adjusted_fair, quote.ask - token.tick_size)
+                # 同时，如果我们想做最佳买家，可以尝试不低于当前的买一
+                raw_price = max(target_price, quote.bid) if target_price >= quote.bid else target_price
+            else:
+                raw_price = max(quote.ask, predicted_mid) * (
+                    Decimal("1") + self.config.fok_price_buffer_fraction
+                )
+            price = min(self.config.max_price, max(self.config.min_price, raw_price))
+            return self.adapter.round_price(price, token.tick_size, ROUND_DOWN if is_gtc else ROUND_UP)
+
+        if is_gtc:
+            # Maker 模式：卖价必须 > 买一 (quote.bid)
+            target_price = max(adjusted_fair, quote.bid + token.tick_size)
+            # 尝试不高于当前的卖一以获得更好的成交概率
+            raw_price = min(target_price, quote.ask) if target_price <= quote.ask else target_price
+        else:
+            raw_price = min(quote.bid, predicted_mid) * (
+                Decimal("1") - self.config.fok_price_buffer_fraction
+            )
         price = min(self.config.max_price, max(self.config.min_price, raw_price))
-        return self.adapter.round_price(price, token.tick_size, ROUND_DOWN)
+        return self.adapter.round_price(price, token.tick_size, ROUND_UP)
