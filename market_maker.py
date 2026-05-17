@@ -381,13 +381,13 @@ class MarketMaker:
                 float(order.notional),
                 order.reason,
             )
-            self.adapter.place_limit_order(
-                token=order.token,
-                side=order.side,
-                price=order.price,
-                size=order.shares,
-                dry_run=self.config.dry_run,
-            )
+            # self.adapter.place_limit_order(
+            #     token=order.token,
+            #     side=order.side,
+            #     price=order.price,
+            #     size=order.shares,
+            #     dry_run=self.config.dry_run,
+            # )
             self._execute_order_with_retry(order)
 
         self.last_placed_orders = orders

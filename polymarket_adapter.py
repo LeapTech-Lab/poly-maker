@@ -264,7 +264,7 @@ class PolymarketAdapter:
                 size,
                 price,
             )
-            return None
+            return {}
 
         order_type_map = {
             "FOK": OrderType.FOK,
