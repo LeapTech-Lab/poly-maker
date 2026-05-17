@@ -704,13 +704,16 @@ class MarketMaker:
 
         if side == "BUY":
             if is_gtc:
+                aggressive_price = max(adjusted_fair, quote.bid)
+                safe_price = min(aggressive_price, quote.ask - token.tick_size)
+                raw_price = safe_price
                 # Maker 模式：买价必须 < 卖一 (quote.ask)
                 # 我们的目标价是预测中价与 (卖一 - 1 tick) 的最小值
-                buffer = token.tick_size * 2
-                target_price = min(adjusted_fair, quote.ask - buffer)
-                # target_price = min(adjusted_fair, quote.ask - token.tick_size)
-                # 同时，如果我们想做最佳买家，可以尝试不低于当前的买一
-                raw_price = max(target_price, quote.bid) if target_price >= quote.bid else target_price
+                # buffer = token.tick_size * 2
+                # target_price = min(adjusted_fair, quote.ask - buffer)
+                # # target_price = min(adjusted_fair, quote.ask - token.tick_size)
+                # # 同时，如果我们想做最佳买家，可以尝试不低于当前的买一
+                # raw_price = max(target_price, quote.bid) if target_price >= quote.bid else target_price
             else:
                 raw_price = max(quote.ask, predicted_mid) * (
                     Decimal("1") + self.config.fok_price_buffer_fraction
@@ -719,10 +722,14 @@ class MarketMaker:
             return self.adapter.round_price(price, token.tick_size, ROUND_DOWN if is_gtc else ROUND_UP)
 
         if is_gtc:
-            # Maker 模式：卖价必须 > 买一 (quote.bid)
-            target_price = max(adjusted_fair, quote.bid + token.tick_size)
-            # 尝试不高于当前的卖一以获得更好的成交概率
-            raw_price = min(target_price, quote.ask) if target_price <= quote.ask else target_price
+            # # Maker 模式：卖价必须 > 买一 (quote.bid)
+            # target_price = max(adjusted_fair, quote.bid + token.tick_size)
+            # # 尝试不高于当前的卖一以获得更好的成交概率
+            # raw_price = min(target_price, quote.ask) if target_price <= quote.ask else target_price
+            aggressive_price = min(adjusted_fair, quote.ask)
+            safe_price = max(aggressive_price, quote.bid + token.tick_size)
+        
+            raw_price = safe_price
         else:
             raw_price = min(quote.bid, predicted_mid) * (
                 Decimal("1") - self.config.fok_price_buffer_fraction
