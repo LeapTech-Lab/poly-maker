@@ -71,6 +71,13 @@ class Position:
         return (self.current_price - self.avg_price) * self.size
 
 
+@dataclass(frozen=True)
+class OrderBookSnapshot:
+    quote: Quote
+    bids: list[tuple[Decimal, Decimal]]
+    asks: list[tuple[Decimal, Decimal]]
+
+
 class PolymarketAdapter:
     def __init__(self, config: BotConfig) -> None:
         self.config = config
@@ -155,16 +162,21 @@ class PolymarketAdapter:
         return str(candidates[0][0])
 
     def get_quote(self, token: TokenConfig) -> Quote:
+        return self.get_order_book_snapshot(token).quote
+
+    def get_order_book_snapshot(self, token: TokenConfig) -> OrderBookSnapshot:
         book = self.client.get_order_book(token.token_id)
         bids = self._levels(book, "bids")
         asks = self._levels(book, "asks")
         if not bids or not asks:
             mid_resp = self.client.get_midpoint(token.token_id)
             mid = Decimal(str(mid_resp["mid"] if isinstance(mid_resp, dict) else mid_resp))
-            return Quote(bid=mid, ask=mid, mid=mid)
+            quote = Quote(bid=mid, ask=mid, mid=mid)
+            return OrderBookSnapshot(quote=quote, bids=bids, asks=asks)
         best_bid = max(price for price, _ in bids)
         best_ask = min(price for price, _ in asks)
-        return Quote(bid=best_bid, ask=best_ask, mid=(best_bid + best_ask) / Decimal("2"))
+        quote = Quote(bid=best_bid, ask=best_ask, mid=(best_bid + best_ask) / Decimal("2"))
+        return OrderBookSnapshot(quote=quote, bids=bids, asks=asks)
 
     def get_positions(
         self,
@@ -217,6 +229,19 @@ class PolymarketAdapter:
         LOGGER.info("Cancelling old orders for token_id=%s", token_id)
         self.client.cancel_market_orders(OrderMarketCancelParams(asset_id=token_id))
 
+    def cancel_orders(self, order_ids: Iterable[str]) -> None:
+        ids = [str(order_id) for order_id in order_ids if order_id]
+        if not ids:
+            return
+        if self.config.dry_run:
+            LOGGER.info("[DRY_RUN] Would cancel %d orders: %s", len(ids), ids)
+            return
+        LOGGER.info("Cancelling %d stale orders", len(ids))
+        try:
+            self.client.cancel_orders(ids)
+        except Exception as exc:
+            LOGGER.warning("Stale order cancel failed; order may already be filled or closed: %s", exc)
+
     def open_orders_for_token(self, token_id: str) -> list[dict[str, Any]]:
         return self.client.get_open_orders(OpenOrderParams(asset_id=token_id))
 
@@ -230,9 +255,17 @@ class PolymarketAdapter:
     ) -> Optional[dict[str, Any]]:
         price = self.round_price(price, token.tick_size, ROUND_DOWN if side == "BUY" else ROUND_UP)
         if dry_run:
-            LOGGER.info("[DRY_RUN] %s %s shares=%s price=%s", side, token.outcome, size, price)
+            LOGGER.info(
+                "[DRY_RUN] %s %s order_type=%s shares=%s price=%s",
+                side,
+                token.outcome,
+                self.config.order_type,
+                size,
+                price,
+            )
             return None
 
+        order_type = OrderType.FOK
         try:
             response = self.client.create_and_post_order(
                 order_args=OrderArgs(
@@ -242,8 +275,8 @@ class PolymarketAdapter:
                     size=float(size),
                 ),
                 options=PartialCreateOrderOptions(tick_size=str(token.tick_size), neg_risk=token.neg_risk),
-                order_type=OrderType.GTC,
-                post_only=self.config.post_only,
+                order_type=order_type,
+                post_only=False,
             )
         except PolyApiException as exc:
             msg = str(exc.error_msg).lower()
@@ -257,7 +290,15 @@ class PolymarketAdapter:
             LOGGER.error("[API_FATAL] Unexpected error during %s %s: %s", side, token.outcome, exc)
             raise
 
-        LOGGER.info("[API_SUCCESS] Posted %s %s shares=%s price=%s response=%s", side, token.outcome, size, price, response)
+        LOGGER.info(
+            "[API_SUCCESS] Posted %s %s order_type=%s shares=%s price=%s response=%s",
+            side,
+            token.outcome,
+            order_type,
+            size,
+            price,
+            response,
+        )
         return response
 
     @staticmethod

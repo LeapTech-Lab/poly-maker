@@ -2,6 +2,9 @@
 
 示例：
     uv run python resolve_market.py "https://polymarket.com/event/.../market-slug"
+    uv run python resolve_market.py "https://polymarket.com/event/event-slug" --list
+    uv run python resolve_market.py "https://polymarket.com/event/event-slug" --index N
+    uv run python resolve_market.py "https://polymarket.com/event/event-slug" --contains "December 31"
     uv run python resolve_market.py market-slug
     uv run python resolve_market.py 0xabc...
 """
@@ -22,14 +25,30 @@ GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
 
 
+def path_parts(value: str) -> list[str]:
+    parsed = urlparse(value)
+    return [part for part in parsed.path.split("/") if part]
+
+
 def normalize_slug(value: str) -> str:
     value = value.strip()
     if value.startswith("http://") or value.startswith("https://"):
-        parsed = urlparse(value)
-        parts = [part for part in parsed.path.split("/") if part]
+        parts = path_parts(value)
         if not parts:
             raise ValueError("URL path is empty")
         return parts[-1]
+    return value.strip("/")
+
+
+def normalize_event_slug(value: str) -> str:
+    value = value.strip()
+    if value.startswith("http://") or value.startswith("https://"):
+        parts = path_parts(value)
+        if "event" in parts:
+            event_idx = parts.index("event")
+            if event_idx + 1 < len(parts):
+                return parts[event_idx + 1]
+        return normalize_slug(value)
     return value.strip("/")
 
 
@@ -96,6 +115,18 @@ def market_from_slug(slug: str, index: int | None = None, contains: str = "") ->
     raise RuntimeError(f"No market found for slug={slug}")
 
 
+def event_markets_from_slug(slug: str, contains: str = "") -> list[dict[str, Any]]:
+    event = get_json(f"{GAMMA}/events/slug/{slug}")
+    markets = event.get("markets", []) if isinstance(event, dict) else []
+    if contains:
+        wanted = contains.lower()
+        markets = [
+            market for market in markets
+            if wanted in str(market.get("question") or market.get("title") or market.get("slug") or "").lower()
+        ]
+    return markets
+
+
 def print_event_markets(markets: list[dict[str, Any]], prefix: str = "这个 event 下有多个子市场") -> None:
     print(prefix + "：")
     for idx, market in enumerate(markets):
@@ -115,6 +146,15 @@ def extract_market(value: str, index: int | None = None, contains: str = "") -> 
     if re.fullmatch(r"0x[a-fA-F0-9]{64}", value.strip()):
         return market_from_condition_id(value.strip())
     return market_from_slug(normalize_slug(value), index=index, contains=contains)
+
+
+def list_markets(value: str, contains: str = "") -> None:
+    slug = normalize_event_slug(value)
+    markets = event_markets_from_slug(slug, contains=contains)
+    if not markets:
+        raise RuntimeError(f"No event markets found for slug={slug}")
+    prefix = "匹配到的子市场" if contains else "这个 event 下有多个子市场"
+    print_event_markets(markets, prefix=prefix)
 
 
 def print_env(market: dict[str, Any]) -> None:
@@ -152,7 +192,11 @@ def main() -> None:
     parser.add_argument("market", help="Polymarket URL, slug, or condition_id")
     parser.add_argument("--index", type=int, default=None, help="event 页面有多个子市场时，选择第几个，从 0 开始")
     parser.add_argument("--contains", default="", help="event 页面有多个子市场时，按问题文本筛选，例如 'December 31'")
+    parser.add_argument("--list", action="store_true", help="只列出 event 下的子市场编号，不输出 env")
     args = parser.parse_args()
+    if args.list:
+        list_markets(args.market, contains=args.contains)
+        return
     print_env(extract_market(args.market, index=args.index, contains=args.contains))
 
 

@@ -47,7 +47,7 @@ def main() -> None:
             try:
                 for maker in makers:
                     maker.tick()
-                time.sleep(config.refresh_interval_seconds)
+                time.sleep(min(maker.next_sleep_seconds() for maker in makers))
             except KeyboardInterrupt:
                 for maker in makers:
                     maker.shutdown()

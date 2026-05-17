@@ -1,7 +1,7 @@
-"""中性 Polymarket Market Making 主逻辑。
+"""短期预测驱动的 Polymarket FOK 执行逻辑。
 
-策略 intentionally 简单：在 YES/NO 两个 outcome token 上同时挂 maker 买单。
-每个订单用美元金额换算 shares，并在每次刷新前取消旧单再重挂，方便控制小资金风险。
+策略 intentionally 简单：预测延迟窗口后的成交价，使用 FOK 激进限价单尝试立刻全成交。
+预测错或流动性不足时，交易所会直接取消整单，不留下挂单。
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from config import BotConfig
 from market_sources import MarketSpec
 from polymarket_adapter import FatalTradingError, PolymarketAdapter, Position, Quote, TokenConfig
+from predictors import ImbalancePredictor, MarketFeatures, ShortHorizonPredictor
 
 
 LOGGER = logging.getLogger(__name__)
@@ -35,10 +36,20 @@ class TargetOrder:
 
 
 class MarketMaker:
-    def __init__(self, config: BotConfig, adapter: PolymarketAdapter, spec: MarketSpec | None = None) -> None:
+    def __init__(
+        self,
+        config: BotConfig,
+        adapter: PolymarketAdapter,
+        spec: MarketSpec | None = None,
+        predictor: ShortHorizonPredictor | None = None,
+    ) -> None:
         self.config = config
         self.adapter = adapter
         self.spec = spec
+        self.predictor = predictor or ImbalancePredictor(
+            impact_bps_per_imbalance=config.prediction_edge_bps,
+            min_confidence=config.min_prediction_confidence,
+        )
         self.should_stop = False
         self.yes: TokenConfig
         self.no: TokenConfig
@@ -47,6 +58,8 @@ class MarketMaker:
         self.last_midpoints: dict[str, Decimal] = {}
         self.risk_off = False
 
+        self.last_placed_orders: list[TargetOrder] = []
+
     def run(self) -> None:
         self.bootstrap()
         failures = 0
@@ -54,7 +67,7 @@ class MarketMaker:
             try:
                 self.tick()
                 failures = 0
-                time.sleep(self.config.refresh_interval_seconds)
+                time.sleep(self.next_sleep_seconds())
             except KeyboardInterrupt:
                 self.should_stop = True
             except FatalTradingError:
@@ -73,6 +86,9 @@ class MarketMaker:
         self.should_stop = True
         self._cancel_working_orders()
 
+    def next_sleep_seconds(self) -> float:
+        return float(self.config.refresh_interval_seconds)
+
     def bootstrap(self) -> None:
         self.config.validate()
         if self.spec is None:
@@ -87,7 +103,7 @@ class MarketMaker:
         self.initial_market_exposure = self._current_market_exposure()
 
         LOGGER.info(
-            "Starting maker: condition_id=%s dry_run=%s order_notional=%s refresh=%ss initial_market_exposure=$%.2f",
+            "Starting FOK executor: condition_id=%s dry_run=%s order_notional=%s refresh=%ss initial_market_exposure=$%.2f",
             self.condition_id or "<token-only>",
             self.config.dry_run,
             self.config.order_notional_usdc,
@@ -96,9 +112,21 @@ class MarketMaker:
         )
 
     def tick(self) -> None:
+        # 1. 获取所有市场数据
         tokens = (self.yes, self.no)
-        quotes = {token.token_id: self.adapter.get_quote(token) for token in tokens}
+        snapshots = {token.token_id: self.adapter.get_order_book_snapshot(token) for token in tokens}
+        quotes = {token_id: snapshot.quote for token_id, snapshot in snapshots.items()}
         positions = self.adapter.get_positions(tokens, quotes=quotes)
+
+        orderbook_imbalances = {
+            token.token_id: self._calculate_orderbook_imbalance(
+                snapshots[token.token_id].bids,
+                snapshots[token.token_id].asks,
+            )
+            for token in tokens
+        }
+
+        # 2. 计算风险敞口和PnL
         account_exposure = self.adapter.get_global_exposure()
         market_exposure = sum(position.notional for position in positions.values())
         bot_exposure = max(Decimal("0"), market_exposure - self.initial_market_exposure)
@@ -159,6 +187,15 @@ class MarketMaker:
         for token in tokens:
             quote = quotes[token.token_id]
             position = positions[token.token_id]
+            imbalance = orderbook_imbalances[token.token_id]
+            prediction = self.predictor.predict(
+                MarketFeatures(
+                    token=token,
+                    quote=quote,
+                    imbalance=imbalance,
+                    latency_ms=self.config.prediction_latency_ms,
+                )
+            )
             
             # 记录盘口详情
             LOGGER.info(
@@ -169,6 +206,14 @@ class MarketMaker:
                 quote.ask,
                 self.last_midpoints.get(token.token_id, "N/A"),
             )
+            LOGGER.info(
+                "[PREDICT] %s: PredMid=%s | EdgeBps=%s | Confidence=%s | Reason=%s",
+                token.outcome,
+                prediction.predicted_mid,
+                prediction.edge_bps,
+                prediction.confidence,
+                prediction.reason,
+            )
 
             allow_new_buy = not close_only and not self._position_risk_off(token, quote, position)
             if self._midpoint_jump_detected(token, quote):
@@ -176,22 +221,32 @@ class MarketMaker:
                 LOGGER.warning("[STRATEGY] %s midpoint jumped too fast; skipping buy", token.outcome)
 
             maybe_order = (
-                self._build_buy_order(token, quote, position, market_exposure)
+                self._build_buy_order(
+                    token,
+                    quote,
+                    position,
+                    market_exposure,
+                    prediction.predicted_mid,
+                )
                 if allow_new_buy
                 else None
             )
             if maybe_order:
                 orders.append(maybe_order)
             
-            maybe_sell = self._build_sell_order(token, quote, position, force_exit=close_only)
+            maybe_sell = self._build_sell_order(
+                token,
+                quote,
+                position,
+                prediction.predicted_mid,
+                force_exit=close_only,
+            )
             if maybe_sell:
                 orders.append(maybe_sell)
 
             self.last_midpoints[token.token_id] = quote.mid
 
-        # 撤单前记录
-        LOGGER.info("[STRATEGY] Refreshing orders: cancelling existing and placing %d new targets", len(orders))
-        self._cancel_working_orders()
+        LOGGER.info("[STRATEGY] Placing %d %s targets", len(orders), self.config.order_type)
         
         for order in orders:
             LOGGER.info(
@@ -211,19 +266,23 @@ class MarketMaker:
                 dry_run=self.config.dry_run,
             )
 
+        self.last_placed_orders = orders
+
     def _build_buy_order(
         self,
         token: TokenConfig,
         quote: Quote,
         position: Position,
         market_exposure: Decimal,
+        predicted_mid: Decimal,
     ) -> TargetOrder | None:
         if quote.mid <= 0:
             LOGGER.warning("%s midpoint unavailable; skip quote", token.outcome)
             return None
+        if predicted_mid <= 0:
+            predicted_mid = quote.mid
 
-        skew = Decimal("0")
-        reason = "neutral"
+        reason = "fok_predicted_buy"
         if position.notional >= self.config.max_token_exposure_usdc:
             LOGGER.info("%s token exposure limit hit; skip buy quote", token.outcome)
             return None
@@ -231,17 +290,27 @@ class MarketMaker:
             LOGGER.info("Market exposure cap reached; skip new buy quote for %s", token.outcome)
             return None
         if position.notional >= self.config.inventory_skew_threshold_usdc:
-            skew = self.config.inventory_skew_fraction
-            reason = "inventory_skew"
+            reason = "fok_inventory_skew_buy"
 
-        spread = self.config.spread_fraction
-        bid = quote.mid * (Decimal("1") - spread - skew)
-        bid = max(self.config.min_price, min(self.config.max_price, bid))
-        bid = self.adapter.round_price(bid, token.tick_size, ROUND_DOWN)
-        
+        min_profitable_mid = quote.ask * (Decimal("1") + self.config.fok_min_edge_fraction)
+        if predicted_mid < min_profitable_mid:
+            LOGGER.info(
+                "%s FOK buy skipped: predicted_mid=%s is below ask edge threshold %s",
+                token.outcome,
+                predicted_mid,
+                min_profitable_mid,
+            )
+            return None
+
+        bid = self._fok_limit_price(token, "BUY", predicted_mid, quote)
+
         LOGGER.debug(
-            "[DEBUG] %s Buy Calculation: Mid=%s * (1 - Spread=%s - Skew=%s) = %s -> Final Bid=%s",
-            token.outcome, quote.mid, spread, skew, (quote.mid * (Decimal("1") - spread - skew)), bid
+            "[DEBUG] %s FOK Buy Calculation: PredMid=%s Ask=%s BufferBps=%s -> Limit=%s",
+            token.outcome,
+            predicted_mid,
+            quote.ask,
+            self.config.fok_price_buffer_bps,
+            bid,
         )
 
         if bid <= 0:
@@ -265,9 +334,10 @@ class MarketMaker:
             return None
 
         LOGGER.info(
-            "%s quote mid=%s bid=%s shares=%s notional=$%.2f reason=%s",
+            "%s FOK buy quote mid=%s ask=%s limit=%s shares=%s notional=$%.2f reason=%s",
             token.outcome,
             quote.mid,
+            quote.ask,
             bid,
             shares,
             float(bid * shares),
@@ -280,23 +350,33 @@ class MarketMaker:
         token: TokenConfig,
         quote: Quote,
         position: Position,
+        predicted_mid: Decimal,
         force_exit: bool = False,
     ) -> TargetOrder | None:
         if position.size <= 0 or quote.mid <= 0:
             return None
+        if predicted_mid <= 0:
+            predicted_mid = quote.mid
 
-        reason = "inventory_exit"
-        skew = Decimal("0")
+        reason = "fok_inventory_exit"
+        force_sell = force_exit
         if force_exit or self._position_risk_off(token, quote, position):
-            skew = self.config.spread_fraction
-            reason = "risk_exit"
+            force_sell = True
+            reason = "fok_risk_exit"
         elif position.notional >= self.config.inventory_skew_threshold_usdc:
-            skew = self.config.inventory_skew_fraction
-            reason = "inventory_skew_exit"
+            reason = "fok_inventory_skew_exit"
 
-        ask = quote.mid * (Decimal("1") + self.config.spread_fraction - skew)
-        ask = max(self.config.min_price, min(self.config.max_price, ask))
-        ask = self.adapter.round_price(ask, token.tick_size, ROUND_UP)
+        max_profitable_mid = quote.bid * (Decimal("1") - self.config.fok_min_edge_fraction)
+        if not force_sell and predicted_mid > max_profitable_mid:
+            LOGGER.info(
+                "%s FOK sell skipped: predicted_mid=%s is above bid edge threshold %s",
+                token.outcome,
+                predicted_mid,
+                max_profitable_mid,
+            )
+            return None
+
+        ask = self._fok_limit_price(token, "SELL", predicted_mid, quote)
         if ask <= 0:
             return None
 
@@ -313,9 +393,10 @@ class MarketMaker:
             return None
 
         LOGGER.info(
-            "%s sell quote mid=%s ask=%s shares=%s notional=$%.2f reason=%s",
+            "%s FOK sell quote mid=%s bid=%s limit=%s shares=%s notional=$%.2f reason=%s",
             token.outcome,
             quote.mid,
+            quote.bid,
             ask,
             shares,
             float(ask * shares),
@@ -408,6 +489,44 @@ class MarketMaker:
     def _cancel_working_orders(self) -> None:
         if self.condition_id:
             self.adapter.cancel_market_orders(self.condition_id)
+            self.last_placed_orders = []
             return
         self.adapter.cancel_token_orders(self.yes.token_id)
         self.adapter.cancel_token_orders(self.no.token_id)
+        self.last_placed_orders = []
+
+    def _calculate_orderbook_imbalance(
+        self,
+        bids: list[tuple[Decimal, Decimal]],
+        asks: list[tuple[Decimal, Decimal]],
+    ) -> Decimal:
+        if not bids or not asks:
+            return Decimal("0")
+
+        levels = self.config.orderbook_imbalance_levels
+        bid_depth = sum(size for _price, size in sorted(bids, reverse=True)[:levels])
+        ask_depth = sum(size for _price, size in sorted(asks)[:levels])
+        total_depth = bid_depth + ask_depth
+        if total_depth <= 0:
+            return Decimal("0")
+        return (bid_depth - ask_depth) / total_depth
+
+    def _fok_limit_price(
+        self,
+        token: TokenConfig,
+        side: str,
+        predicted_mid: Decimal,
+        quote: Quote,
+    ) -> Decimal:
+        if side == "BUY":
+            raw_price = max(quote.ask, predicted_mid) * (
+                Decimal("1") + self.config.fok_price_buffer_fraction
+            )
+            price = min(self.config.max_price, max(self.config.min_price, raw_price))
+            return self.adapter.round_price(price, token.tick_size, ROUND_UP)
+
+        raw_price = min(quote.bid, predicted_mid) * (
+            Decimal("1") - self.config.fok_price_buffer_fraction
+        )
+        price = min(self.config.max_price, max(self.config.min_price, raw_price))
+        return self.adapter.round_price(price, token.tick_size, ROUND_DOWN)
