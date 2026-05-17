@@ -282,6 +282,8 @@ class PolymarketAdapter:
                 options=PartialCreateOrderOptions(tick_size=str(token.tick_size), neg_risk=token.neg_risk),
                 order_type=order_type,
                 post_only=self.config.post_only,
+        )
+        # except PolyApiException as exc:
         #     msg = str(exc.error_msg).lower()
         #     # 检查是否是签名/认证相关的致命错误
         #     if "invalid signature" in msg or "invalid funder" in msg or "api key" in msg:
