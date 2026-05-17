@@ -35,6 +35,9 @@ def _int(name: str, default: str) -> int:
 def _bool(name: str, default: str = "false") -> bool:
     return (_env(name, default) or default).strip().lower() in {"1", "true", "yes", "y"}
 
+def _decimal_from_env(key: str, default: str) -> Decimal:
+    return Decimal(os.environ.get(key, default))
+
 
 @dataclass(frozen=True)
 class BotConfig:
@@ -75,6 +78,10 @@ class BotConfig:
     max_global_exposure_usdc: Decimal = _decimal("MAX_GLOBAL_EXPOSURE_USDC", "80")
     count_existing_positions_in_global_limit: bool = _bool("COUNT_EXISTING_POSITIONS_IN_GLOBAL_LIMIT", "false")
     inventory_skew_threshold_usdc: Decimal = _decimal("INVENTORY_SKEW_THRESHOLD_USDC", "18")
+    # 方向性偏斜调整因子，用于根据市场价格调整报价。
+    # 0 表示禁用，值越大，报价的“偏见”越强。
+    # 建议从 0.1 到 1.0 之间开始测试。
+    directional_skew_factor: Decimal = _decimal_from_env("DIRECTIONAL_SKEW_FACTOR", "0.5")
     inventory_skew_bps: Decimal = _decimal("INVENTORY_SKEW_BPS", "60")
     stop_loss_pct: Decimal = _decimal("STOP_LOSS_PCT", "12")
     take_profit_pct: Decimal = _decimal("TAKE_PROFIT_PCT", "8")

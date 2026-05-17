@@ -285,12 +285,14 @@ class PolymarketAdapter:
             )
         except PolyApiException as exc:
             msg = str(exc.error_msg).lower()
-            if "invalid signature" in msg or "invalid funder" in msg:
+            # 检查是否是签名/认证相关的致命错误
+            if "invalid signature" in msg or "invalid funder" in msg or "api key" in msg:
                 raise FatalTradingError(
                     "Order signing failed. Check PK, SIGNATURE_TYPE, and FUNDER_ADDRESS."
                 ) from exc
-            if "post only" in msg or "order would have crossed" in msg:
-                LOGGER.warning("[POST_ONLY] %s %s rejected (would cross)", side, token.outcome)
+            if "post only" in msg or "order crosses book" in msg or "order would have crossed" in msg:
+                LOGGER.warning("[POST_ONLY] %s %s @ %s rejected (would cross book)", side, token.outcome, price)
+                # 将其视为非致命错误，只返回一个提示，不抛出异常
                 return {"error": "post_only_crossed"}
             LOGGER.error("[API_ERROR] %s %s failed: %s", side, token.outcome, msg)
             raise
