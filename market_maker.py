@@ -236,6 +236,9 @@ class MarketMaker:
             self.risk_off = self.config.risk_off_after_stop
             LOGGER.warning("[RISK] Market loss limit hit (uPnL=$%.2f); enabling close-only mode", float(unrealized_pnl))
 
+        # --- 新增：计算市场信念因子 ---
+        market_conviction_yes = quotes[self.yes.token_id].mid
+
         orders: list[TargetOrder] = []
         tick_data_to_log = {} # MODIFICATION: 准备记录数据
 
@@ -320,6 +323,7 @@ class MarketMaker:
                     position,
                     market_exposure,
                     prediction.predicted_mid,
+                    market_conviction_yes=market_conviction_yes,
                 )
                 if allow_new_buy
                 else None
@@ -333,6 +337,7 @@ class MarketMaker:
                 position,
                 prediction.predicted_mid,
                 force_exit=close_only,
+                market_conviction_yes=market_conviction_yes,
             )
             if maybe_sell:
                 orders.append(maybe_sell)
@@ -372,6 +377,8 @@ class MarketMaker:
         position: Position,
         market_exposure: Decimal,
         predicted_mid: Decimal,
+        # --- 新增接收这个参数 ---
+        market_conviction_yes: Decimal,
     ) -> TargetOrder | None:
         if quote.mid <= 0:
             LOGGER.warning("%s midpoint unavailable; skip quote", token.outcome)
@@ -399,8 +406,9 @@ class MarketMaker:
             )
             return None
 
-        bid = self._calculate_limit_price(token, "BUY", predicted_mid, quote, position)
-
+        # bid = self._calculate_limit_price(token, "BUY", predicted_mid, quote, position)
+        bid = self._calculate_limit_price(token, "BUY", predicted_mid, quote, position, market_conviction_yes)
+    
         LOGGER.debug(
             "[DEBUG] %s Buy Calculation: PredMid=%s Ask=%s -> Limit=%s",
             token.outcome,
@@ -447,6 +455,8 @@ class MarketMaker:
         quote: Quote,
         position: Position,
         predicted_mid: Decimal,
+        # --- 新增接收这个参数 ---
+        market_conviction_yes: Decimal,
         force_exit: bool = False,
     ) -> TargetOrder | None:
         if position.size <= 0 or quote.mid <= 0:
@@ -472,7 +482,10 @@ class MarketMaker:
             )
             return None
 
-        ask = self._calculate_limit_price(token, "SELL", predicted_mid, quote, position)
+        # ask = self._calculate_limit_price(token, "SELL", predicted_mid, quote, position)
+        # --- 修改这里的调用 ---
+        ask = self._calculate_limit_price(token, "SELL", predicted_mid, quote, position, market_conviction_yes)
+   
         if ask <= 0:
             return None
 
@@ -627,6 +640,7 @@ class MarketMaker:
         predicted_mid: Decimal,
         quote: Quote,
         position: Position,
+        market_conviction_yes: Decimal,
     ) -> Decimal:
         is_gtc = self.config.order_type == "GTC"
         
@@ -635,7 +649,36 @@ class MarketMaker:
         inventory_ratio = position.notional / max(Decimal("1"), self.config.max_token_exposure_usdc)
         # 根据持仓调整预测的中价：持仓越多，报价越低 (偏向卖出)
         skew_adjust = inventory_ratio * self.config.inventory_skew_fraction * quote.mid
-        adjusted_fair = predicted_mid - skew_adjust
+        # adjusted_fair = predicted_mid - skew_adjust
+
+        # 2. --- 新增：方向性调整 (Directional Skew) ---
+        directional_skew_adjust = Decimal("0")
+        # 定义一个调整强度的系数，可以在 config.py 中配置
+        # directional_skew_factor = Decimal("0.5") 
+        directional_skew_factor = self.config.directional_skew_factor
+
+        # 如果我们正在为 YES 代币定价
+        if token.outcome == "YES":
+            # 如果市场强烈看好 YES (价格 > 0.7)，我们就降低自己的买价（变得更挑剔），
+            # 同时也会间接降低卖价（更想卖掉已有库存）。
+            # (market_conviction_yes - 0.5) 是一个中性值为0的偏离度。
+            directional_skew_adjust = (market_conviction_yes - Decimal("0.5")) * directional_skew_factor * quote.mid
+        # 如果我们正在为 NO 代币定价
+        elif token.outcome == "NO":
+            # NO 的信念与 YES 相反
+            market_conviction_no = Decimal("1") - market_conviction_yes
+            # 如果市场强烈看好 NO (价格 > 0.7)，我们就降低自己的买价
+            directional_skew_adjust = (market_conviction_no - Decimal("0.5")) * directional_skew_factor * quote.mid
+        # 3. 组合所有调整
+        adjusted_fair = predicted_mid - skew_adjust - directional_skew_adjust
+        LOGGER.debug(
+        "[DEBUG] %s %s PriceCalc: PredMid=%s, InvSkew=%s, DirSkew=%s -> AdjustedFair=%s",
+        side, token.outcome, predicted_mid.quantize(Decimal("0.0001")),
+        skew_adjust.quantize(Decimal("0.0001")),
+        directional_skew_adjust.quantize(Decimal("0.0001")),
+        adjusted_fair.quantize(Decimal("0.0001"))
+    )
+
 
         if side == "BUY":
             if is_gtc:
