@@ -16,6 +16,7 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from config import BotConfig
 from market_sources import MarketSpec
 from polymarket_adapter import FatalTradingError, PolymarketAdapter, Position, Quote, TokenConfig
+from py_clob_client_v2.exceptions import PolyApiException
 from predictors import ImbalancePredictor, MarketFeatures, ShortHorizonPredictor
 # MODIFICATION: 导入新的预测器和数据记录器
 from advanced_predictors import AdvancedPredictor, AdvancedMarketFeatures
@@ -62,6 +63,13 @@ class MarketMaker:
         self.risk_off = False
 
         self.last_placed_orders: list[TargetOrder] = []
+
+        # --- 新增：动态订单金额状态 ---
+        # 存储当前有效的下单名义价值。初始化为配置值。
+        self.dynamic_order_notional: Decimal = config.order_notional_usdc
+        # 记录上次成功下单的时间，用于逐步恢复金额
+        self.last_success_order_time: float = time.time()
+        # --- 结束 ---
 
     def run(self) -> None:
         self.bootstrap()
@@ -154,6 +162,19 @@ class MarketMaker:
         return (taker_buy_volume - taker_sell_volume) / total_volume
     
     def tick(self) -> None:
+        # --- 新增：动态金额恢复逻辑 ---
+        # 如果动态金额低于配置值，并且距离上次成功下单已超过一段时间（例如30秒），
+        # 就尝试将金额逐步恢复。
+        if (self.dynamic_order_notional < self.config.order_notional_usdc and
+            time.time() - self.last_success_order_time > 30):
+
+            # 每次恢复一点点，比如恢复10%的差距
+            new_notional = self.dynamic_order_notional + (self.config.order_notional_usdc - self.dynamic_order_notional) * Decimal("0.1")
+            self.dynamic_order_notional = min(new_notional, self.config.order_notional_usdc)
+            LOGGER.info("[STRATEGY] Gradually restoring order notional to $%.2f", self.dynamic_order_notional)
+
+        # --- 结束 ---
+
         # 对于 GTC 模式，每轮需要先清理之前的挂单
         if self.config.order_type == "GTC":
             self._cancel_working_orders()
@@ -367,6 +388,7 @@ class MarketMaker:
                 size=order.shares,
                 dry_run=self.config.dry_run,
             )
+            self._execute_order_with_retry(order)
 
         self.last_placed_orders = orders
 
@@ -422,7 +444,7 @@ class MarketMaker:
 
         remaining_market = self.config.max_market_exposure_usdc - market_exposure
         remaining_token = self.config.max_token_exposure_usdc - position.notional
-        order_notional = min(self.config.order_notional_usdc, remaining_market, remaining_token)
+        order_notional = min(self.dynamic_order_notional, remaining_market, remaining_token)
         if order_notional <= 0:
             return None
 
@@ -489,7 +511,7 @@ class MarketMaker:
         if ask <= 0:
             return None
 
-        target_notional = min(self.config.order_notional_usdc, position.notional)
+        target_notional = min(self.dynamic_order_notional, position.notional)
         desired_shares = (target_notional / ask).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
         shares = min(position.size, desired_shares)
         if shares < token.min_order_size:
@@ -707,3 +729,76 @@ class MarketMaker:
             )
         price = min(self.config.max_price, max(self.config.min_price, raw_price))
         return self.adapter.round_price(price, token.tick_size, ROUND_UP)
+    
+
+    def _execute_order_with_retry(self, order: TargetOrder, max_retries: int = 3):
+        """
+        执行一个下单目标，并在遇到“余额不足”时自动降低金额并重试。
+        """
+        current_notional = self.dynamic_order_notional
+        current_shares = order.shares
+        current_price = order.price
+
+        for attempt in range(max_retries):
+            try:
+                LOGGER.info(
+                    "[TRADE] Attempt %d: Placing %s %s: Price=%s | Shares=%s | Notional=$%.2f",
+                    attempt + 1, order.side, order.token.outcome, current_price,
+                    current_shares, float(current_price * current_shares)
+                )
+
+                self.adapter.place_limit_order(
+                    token=order.token,
+                    side=order.side,
+                    price=current_price,
+                    size=current_shares,
+                    dry_run=self.config.dry_run,
+                )
+
+                # 如果下单成功
+                LOGGER.info("Successfully placed order.")
+                # 记录成功时间，并返回
+                self.last_success_order_time = time.time()
+                return
+
+            except PolyApiException as exc:
+                msg = str(exc.error_msg).lower()
+                # 检查是否是“余额不足”错误
+                if "not enough balance" in msg:
+                    LOGGER.warning(
+                        "[RETRY] Attempt %d failed: Not enough balance. Reducing notional and retrying.",
+                        attempt + 1
+                    )
+                    # 将下单金额降低10%
+                    current_notional *= Decimal("0.9")
+                    # 更新下单股数
+                    new_shares = self._shares_for_notional(current_notional, current_price, order.token)
+
+                    if new_shares is None:
+                        LOGGER.error("Reduced notional is too small to place order. Aborting retry.")
+                        # 将这个打折后的金额保存下来，以便下一轮使用
+                        self.dynamic_order_notional = max(current_notional, Decimal("1.0")) # 避免降到0
+                        break # 退出重试循环
+
+                    current_shares = new_shares
+                    # 短暂等待后重试
+                    time.sleep(0.5) 
+                    continue # 继续下一次循环尝试
+
+                # 对于其他 post-only 错误，只记录不重试
+                elif "post only" in msg or "order crosses book" in msg:
+                    LOGGER.warning("[POST_ONLY] %s %s @ %s rejected (would cross book)", order.side, order.token.outcome, current_price)
+                    break # 退出重试循环
+
+                else:
+                    # 对于其他所有 API 错误，直接抛出，让主循环捕获
+                    LOGGER.error("[API_ERROR] Unhandled API error on order placement: %s", msg)
+                    raise
+
+        # 如果所有重试都失败了
+        LOGGER.error(
+            "Failed to place order for %s %s after %d retries.",
+            order.side, order.token.outcome, max_retries
+        )
+        # 将最后一次尝试的、打折后的金额保存下来，作为下一轮的动态金额
+        self.dynamic_order_notional = max(current_notional, Decimal("1.0"))
