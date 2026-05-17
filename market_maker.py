@@ -188,22 +188,30 @@ class MarketMaker:
             quote = quotes[token.token_id]
             position = positions[token.token_id]
             imbalance = orderbook_imbalances[token.token_id]
+            best_bid_size, best_ask_size = self._top_of_book_sizes(
+                snapshots[token.token_id].bids,
+                snapshots[token.token_id].asks,
+            )
             prediction = self.predictor.predict(
                 MarketFeatures(
                     token=token,
                     quote=quote,
                     imbalance=imbalance,
                     latency_ms=self.config.prediction_latency_ms,
+                    best_bid_size=best_bid_size,
+                    best_ask_size=best_ask_size,
                 )
             )
             
             # 记录盘口详情
             LOGGER.info(
-                "[MARKET] %s: Mid=%s | Bid=%s | Ask=%s | LastMid=%s",
+                "[MARKET] %s: Mid=%s | Bid=%s x %s | Ask=%s x %s | LastMid=%s",
                 token.outcome,
                 quote.mid,
                 quote.bid,
+                best_bid_size,
                 quote.ask,
+                best_ask_size,
                 self.last_midpoints.get(token.token_id, "N/A"),
             )
             LOGGER.info(
@@ -293,12 +301,15 @@ class MarketMaker:
             reason = "fok_inventory_skew_buy"
 
         min_profitable_mid = quote.ask * (Decimal("1") + self.config.fok_min_edge_fraction)
+        required_edge_bps = (min_profitable_mid - quote.mid) / quote.mid * Decimal("10000")
         if predicted_mid < min_profitable_mid:
             LOGGER.info(
-                "%s FOK buy skipped: predicted_mid=%s is below ask edge threshold %s",
+                "%s FOK buy skipped: predicted_mid=%s is below ask edge threshold %s "
+                "(need_edge_bps=%s)",
                 token.outcome,
                 predicted_mid,
                 min_profitable_mid,
+                required_edge_bps,
             )
             return None
 
@@ -367,12 +378,15 @@ class MarketMaker:
             reason = "fok_inventory_skew_exit"
 
         max_profitable_mid = quote.bid * (Decimal("1") - self.config.fok_min_edge_fraction)
+        required_edge_bps = (max_profitable_mid - quote.mid) / quote.mid * Decimal("10000")
         if not force_sell and predicted_mid > max_profitable_mid:
             LOGGER.info(
-                "%s FOK sell skipped: predicted_mid=%s is above bid edge threshold %s",
+                "%s FOK sell skipped: predicted_mid=%s is above bid edge threshold %s "
+                "(need_edge_bps=%s)",
                 token.outcome,
                 predicted_mid,
                 max_profitable_mid,
+                required_edge_bps,
             )
             return None
 
@@ -510,6 +524,19 @@ class MarketMaker:
         if total_depth <= 0:
             return Decimal("0")
         return (bid_depth - ask_depth) / total_depth
+
+    @staticmethod
+    def _top_of_book_sizes(
+        bids: list[tuple[Decimal, Decimal]],
+        asks: list[tuple[Decimal, Decimal]],
+    ) -> tuple[Decimal, Decimal]:
+        best_bid_size = Decimal("0")
+        best_ask_size = Decimal("0")
+        if bids:
+            _price, best_bid_size = max(bids, key=lambda level: level[0])
+        if asks:
+            _price, best_ask_size = min(asks, key=lambda level: level[0])
+        return best_bid_size, best_ask_size
 
     def _fok_limit_price(
         self,
