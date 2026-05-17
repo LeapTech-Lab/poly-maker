@@ -22,6 +22,7 @@ from py_clob_client_v2 import (
     OrderType,
     PartialCreateOrderOptions,
     Side,
+    TradeParams
 )
 from py_clob_client_v2.exceptions import PolyApiException
 
@@ -380,8 +381,9 @@ class PolymarketAdapter:
     def get_recent_trades(self, token_id: int) -> list:
         """获取指定token的最近成交记录。"""
         try:
-            # 修正：直接调用 get_trades，不传递 limit 参数
-            return self.client.get_trades(token_id)
+            # 修正：创建一个 TradeParams 对象，并通过 asset_id 过滤
+            params = TradeParams(asset_id=str(token_id))
+            return self.client.get_trades(params=params)
         except Exception:
             LOGGER.exception("Failed to fetch recent trades for token_id: %s", token_id)
             return []
