@@ -62,7 +62,12 @@ def main() -> None:
         t1 = time.perf_counter_ns()
 
         price = _safe_probe_price(adapter, token, snapshot)
-        size = max(token.min_order_size, (config.order_notional_usdc / price).quantize(Decimal("0.000001")))
+        # size = max(token.min_order_size, (config.order_notional_usdc / price).quantize(Decimal("0.000001")))
+        # FOK 订单是 taker 订单, API 限制 taker 金额最多4位小数
+        # 我们直接在这里将精度限制为4位
+        raw_size = (config.order_notional_usdc / price)
+        quantized_size = raw_size.quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+        size = max(token.min_order_size, quantized_size)
         t2 = time.perf_counter_ns()
         signed_order = None
         if can_sign:

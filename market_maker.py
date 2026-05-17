@@ -557,7 +557,9 @@ class MarketMaker:
             if is_gtc:
                 # Maker 模式：买价必须 < 卖一 (quote.ask)
                 # 我们的目标价是预测中价与 (卖一 - 1 tick) 的最小值
-                target_price = min(adjusted_fair, quote.ask - token.tick_size)
+                buffer = token.tick_size * 2
+                target_price = min(adjusted_fair, quote.ask - buffer)
+                # target_price = min(adjusted_fair, quote.ask - token.tick_size)
                 # 同时，如果我们想做最佳买家，可以尝试不低于当前的买一
                 raw_price = max(target_price, quote.bid) if target_price >= quote.bid else target_price
             else:
