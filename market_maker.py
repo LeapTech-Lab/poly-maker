@@ -17,7 +17,9 @@ from config import BotConfig
 from market_sources import MarketSpec
 from polymarket_adapter import FatalTradingError, PolymarketAdapter, Position, Quote, TokenConfig
 from predictors import ImbalancePredictor, MarketFeatures, ShortHorizonPredictor
-
+# MODIFICATION: 导入新的预测器和数据记录器
+from advanced_predictors import AdvancedPredictor, AdvancedMarketFeatures
+from data_recorder import DataRecorder
 
 LOGGER = logging.getLogger(__name__)
 
@@ -50,6 +52,7 @@ class MarketMaker:
             impact_bps_per_imbalance=config.prediction_edge_bps,
             min_confidence=config.min_prediction_confidence,
         )
+        self.data_recorder: DataRecorder | None = None
         self.should_stop = False
         self.yes: TokenConfig
         self.no: TokenConfig
@@ -78,9 +81,13 @@ class MarketMaker:
                 sleep_for = min(30, 2**min(failures, 5))
                 LOGGER.exception("Main loop error; reconnecting after %ss", sleep_for)
                 time.sleep(sleep_for)
-
+    
         self._cancel_working_orders()
         LOGGER.info("Stopped; old orders cancelled")
+        # MODIFICATION: 停止数据记录器
+        if self.data_recorder:
+            self.data_recorder.stop()
+
 
     def shutdown(self) -> None:
         self.should_stop = True
@@ -102,6 +109,21 @@ class MarketMaker:
 
         self.initial_market_exposure = self._current_market_exposure()
 
+
+        # MODIFICATION: 在 bootstrap 中初始化预测器和数据记录器
+        if self.predictor is None:
+            self.predictor = AdvancedPredictor(
+                impact_bps_per_imbalance=self.config.prediction_edge_bps,
+                min_confidence=self.config.min_prediction_confidence,
+            )
+        if self.data_recorder is None and self.condition_id:
+            self.data_recorder = DataRecorder(self.condition_id)
+
+        if self.config.cancel_on_start:
+            self._cancel_working_orders()
+
+        self.initial_market_exposure = self._current_market_exposure()
+
         LOGGER.info(
             "Starting Market Maker: condition_id=%s dry_run=%s order_type=%s post_only=%s order_notional=%s refresh=%ss",
             self.condition_id or "<token-only>",
@@ -112,6 +134,25 @@ class MarketMaker:
             self.config.refresh_interval_seconds,
         )
 
+    # MODIFICATION: 在 tick 的开头添加 _calculate_trade_flow 辅助函数
+    def _calculate_trade_flow(self, trades: list) -> Decimal:
+        """计算订单方向性因子（交易流）。
+      
+        返回一个在 -1 到 1 之间的值。
+        正值表示买方更激进（吃掉卖单），负值表示卖方更激进。
+        """
+        if not trades:
+            return Decimal("0")
+      
+        taker_buy_volume = sum(Decimal(t['size']) for t in trades if t['side'] == 'buy')
+        taker_sell_volume = sum(Decimal(t['size']) for t in trades if t['side'] == 'sell')
+        total_volume = taker_buy_volume + taker_sell_volume
+
+        if total_volume == 0:
+            return Decimal("0")
+          
+        return (taker_buy_volume - taker_sell_volume) / total_volume
+    
     def tick(self) -> None:
         # 对于 GTC 模式，每轮需要先清理之前的挂单
         if self.config.order_type == "GTC":
@@ -122,6 +163,13 @@ class MarketMaker:
         snapshots = {token.token_id: self.adapter.get_order_book_snapshot(token) for token in tokens}
         quotes = {token_id: snapshot.quote for token_id, snapshot in snapshots.items()}
         positions = self.adapter.get_positions(tokens, quotes=quotes)
+
+        # MODIFICATION: 获取最近成交和计算交易流
+        recent_trades_yes = self.adapter.get_recent_trades(self.yes.token_id)
+        trade_flow_yes = self._calculate_trade_flow(recent_trades_yes)
+        # 对于二元期权市场，通常只分析一个方向的交易流就足够了
+        trade_flows = {self.yes.token_id: trade_flow_yes, self.no.token_id: -trade_flow_yes}
+
 
         orderbook_imbalances = {
             token.token_id: self._calculate_orderbook_imbalance(
@@ -189,6 +237,8 @@ class MarketMaker:
             LOGGER.warning("[RISK] Market loss limit hit (uPnL=$%.2f); enabling close-only mode", float(unrealized_pnl))
 
         orders: list[TargetOrder] = []
+        tick_data_to_log = {} # MODIFICATION: 准备记录数据
+
         for token in tokens:
             quote = quotes[token.token_id]
             position = positions[token.token_id]
@@ -197,6 +247,19 @@ class MarketMaker:
                 snapshots[token.token_id].bids,
                 snapshots[token.token_id].asks,
             )
+
+            # MODIFICATION: 构建 AdvancedMarketFeatures 并进行预测
+            advanced_features = AdvancedMarketFeatures(
+                token=token,
+                quote=quote,
+                imbalance=imbalance,
+                latency_ms=self.config.prediction_latency_ms,
+                best_bid_size=best_bid_size,
+                best_ask_size=best_ask_size,
+                trade_flow=trade_flows.get(token.token_id, Decimal("0")),
+                # 波动率是在 predictor 内部计算和维护的
+            )
+
             prediction = self.predictor.predict(
                 MarketFeatures(
                     token=token,
@@ -228,6 +291,23 @@ class MarketMaker:
                 prediction.reason,
             )
 
+
+            # MODIFICATION: 记录本轮的所有数据
+            if self.data_recorder and token.outcome == "YES": # 只记录一次避免重复
+                tick_data_to_log = {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "mid_price": quote.mid,
+                    "bid_price": quote.bid,
+                    "ask_price": quote.ask,
+                    "best_bid_size": best_bid_size,
+                    "best_ask_size": best_ask_size,
+                    "imbalance": imbalance,
+                    "trade_flow": trade_flows.get(token.token_id, Decimal("0")),
+                    "predicted_mid": prediction.predicted_mid,
+                    "prediction_reason": prediction.reason,
+                    "unrealized_pnl": unrealized_pnl,
+                }
+
             allow_new_buy = not close_only and not self._position_risk_off(token, quote, position)
             if self._midpoint_jump_detected(token, quote):
                 allow_new_buy = False
@@ -258,6 +338,10 @@ class MarketMaker:
                 orders.append(maybe_sell)
 
             self.last_midpoints[token.token_id] = quote.mid
+        
+        # MODIFICATION: 在下单前，将本轮数据发送到记录器队列
+        if self.data_recorder and tick_data_to_log:
+            self.data_recorder.record(tick_data_to_log)
 
         LOGGER.info("[STRATEGY] Placing %d %s targets", len(orders), self.config.order_type)
         

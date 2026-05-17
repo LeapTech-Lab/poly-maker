@@ -376,3 +376,12 @@ class PolymarketAdapter:
         response.raise_for_status()
         data = response.json()
         return data if isinstance(data, list) else data.get("data", [])
+        
+    def get_recent_trades(self, token_id: int) -> list:
+        """获取指定token的最近成交记录。"""
+        try:
+            # 修正：直接调用 get_trades，不传递 limit 参数
+            return self.client.get_trades(token_id)
+        except Exception:
+            LOGGER.exception("Failed to fetch recent trades for token_id: %s", token_id)
+            return []
